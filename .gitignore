@@ -1,0 +1,17 @@
+# Directories to ignore
+data/
+logs/
+output/
+venv/
+
+# Specific files to ignore
+.DS_Store
+*.pyc
+
+# IP2Location binary file
+IP-COUNTRY-REGION-CITY.BIN
+
+# Processed ID files
+processed_product_ids.json
+unique_ips.json
+unique_product_ids.json
