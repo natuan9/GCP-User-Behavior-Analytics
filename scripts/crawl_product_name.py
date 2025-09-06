@@ -14,6 +14,7 @@ import sys
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 # --- Set up logging for better tracking and error reporting ---
 def setup_logging(log_file, error_log_file):
@@ -60,46 +61,95 @@ def connect_to_mongodb(mongo_uri, db_name):
         logging.error(f"Could not connect to MongoDB: {e}")
         return None, None
 
-# --- Function to get unique product URLs ---
-def get_unique_product_urls(summary_collection, unique_ids_file, event_collections):
-    """Extracts unique product IDs and URLs from a MongoDB collection or a file."""
-    product_urls = {}
+# --- Function to get unique product IDs only ---
+def get_unique_product_ids(summary_collection, unique_ids_file, event_collections):
+    """Extracts unique product IDs from a MongoDB collection or a file."""
+    product_ids = set()
     if os.path.exists(unique_ids_file):
-        logging.info(f"Loading unique product IDs and URLs from file: '{unique_ids_file}'...")
+        logging.info(f"Loading unique product IDs from file: '{unique_ids_file}'...")
         try:
             with open(unique_ids_file, 'r') as f:
-                product_urls = json.load(f)
-            logging.info(f"Loaded {len(product_urls)} unique product IDs from file.")
-            return product_urls
+                product_ids = set(json.load(f))
+            logging.info(f"Loaded {len(product_ids)} unique product IDs from file.")
+            return product_ids
         except Exception as e:
             logging.error(f"Error loading unique product IDs from file: {e}. Re-extracting from MongoDB.")
 
-    logging.info(f"Extracting unique product IDs and URLs from the 'summary' collection for events: {event_collections}")
+    logging.info(f"Extracting unique product IDs from the 'summary' collection for events: {event_collections}")
     try:
         query = {"collection": {"$in": event_collections}}
-        cursor = summary_collection.find(query, {"product_id": 1, "viewing_product_id": 1, "current_url": 1, "referrer_url": 1, "collections": 1, "_id": 0})
+        cursor = summary_collection.find(query, {"product_id": 1, "viewing_product_id": 1, "collection": 1, "_id": 0})
         
         for doc in cursor:
             collection_name = doc.get('collection')
             
             if collection_name == 'product_view_all_recommend_clicked':
                 product_id = doc.get('viewing_product_id')
-                url = doc.get('referrer_url')
             else:
                 product_id = doc.get('product_id') or doc.get('viewing_product_id')
-                url = doc.get('current_url')
             
-            if product_id and url and product_id not in product_urls:
-                product_urls[product_id] = url
+            if product_id:
+                product_ids.add(product_id)
         
         with open(unique_ids_file, 'w') as f:
-            json.dump(product_urls, f, indent=4)
+            json.dump(list(product_ids), f, indent=4)
         
-        logging.info(f"Finished extracting. Found {len(product_urls)} unique product IDs. Saved to '{unique_ids_file}'.")
-        return product_urls
+        logging.info(f"Finished extracting. Found {len(product_ids)} unique product IDs. Saved to '{unique_ids_file}'.")
+        return product_ids
     except Exception as e:
         logging.error(f"Error while fetching data from the 'summary' collection: {e}")
         return None
+
+# --- Function to extract React data from script tag ---
+def extract_react_data(html_content):
+    """Extracts React data from script tag containing var react_data."""
+    try:
+        # Find the script tag containing react_data
+        pattern = r'var\s+react_data\s*=\s*({.*?});'
+        match = re.search(pattern, html_content, re.DOTALL)
+        
+        if match:
+            json_str = match.group(1)
+            react_data = json.loads(json_str)
+            return react_data
+        else:
+            return None
+    except (json.JSONDecodeError, AttributeError) as e:
+        logging.error(f"Error parsing react_data: {e}")
+        return None
+
+# --- Function to extract product data from React data ---
+def extract_product_fields(react_data):
+    """Extracts specific product fields from React data."""
+    product_data = {}
+    
+    try:
+        # Navigate through the React data structure to find product info
+        # This might need adjustment based on the actual structure
+        if 'product' in react_data:
+            product = react_data['product']
+        elif 'data' in react_data and 'product' in react_data['data']:
+            product = react_data['data']['product']
+        else:
+            # Try to find product data in any nested structure
+            product = react_data
+        
+        # Extract the required fields
+        fields_to_extract = [
+            'name', 'attribute_set', 'type_id', 'price', 'min_price', 'max_price',
+            'gold_weight', 'none_metal_weight', 'fixed_silver_weight', 'material_design',
+            'qty', 'collection', 'product_type', 'category_name', 'platinum_palladium_info_in_alloy',
+            'bracelet_without_chain', 'gender', 'included_chain_weight'
+        ]
+        
+        for field in fields_to_extract:
+            product_data[field] = product.get(field, '')
+            
+        return product_data
+        
+    except Exception as e:
+        logging.error(f"Error extracting product fields: {e}")
+        return {}
 
 # --- Thread-safe data handler for checkpoint saves ---
 class ThreadSafeDataHandler:
@@ -126,14 +176,13 @@ class ThreadSafeDataHandler:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
     
-    def add_success(self, product_id, product_name, url):
+    def add_success(self, product_id, product_data, url):
         """Add successful crawl result."""
         with self.lock:
-            self.success_data.append({
-                "product_id": product_id,
-                "product_name": product_name,
-                "url": url
-            })
+            success_record = {"product_id": product_id, "url": url}
+            success_record.update(product_data)
+            
+            self.success_data.append(success_record)
             self.processed_ids.add(product_id)
             self.processed_count += 1
             self.successful_count += 1
@@ -167,7 +216,16 @@ class ThreadSafeDataHandler:
                     
                     # Save successful products to CSV
                     if self.success_data:
-                        fieldnames = ["product_id", "product_name", "url"]
+                        # Define all possible fieldnames
+                        base_fields = ["product_id", "url"]
+                        product_fields = [
+                            'name', 'attribute_set', 'type_id', 'price', 'min_price', 'max_price',
+                            'gold_weight', 'none_metal_weight', 'fixed_silver_weight', 'material_design',
+                            'qty', 'collection', 'product_type', 'category_name', 'platinum_palladium_info_in_alloy',
+                            'bracelet_without_chain', 'gender', 'included_chain_weight'
+                        ]
+                        fieldnames = base_fields + product_fields
+                        
                         with open(self.success_output_file, 'w', newline='', encoding='utf-8') as csvfile:
                             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                             writer.writeheader()
@@ -183,26 +241,30 @@ class ThreadSafeDataHandler:
             return False
 
 # --- Single URL crawling function for threading ---
-def crawl_single_url(product_id, url, data_handler, crawl_delay_min, crawl_delay_max, retry_delay):
-    """Crawls a single URL and processes the data."""
+def crawl_single_url(product_id, data_handler, crawl_delay_min, crawl_delay_max, retry_delay):
+    """Crawls a single product URL and processes the data."""
 
     session = requests.Session()
+    url = f"https://www.glamira.com/catalog/product/view/id/{product_id}"
     
     try:
-        if not urlparse(url).scheme:
-            url = f"https://www.glamira.vn/{url.lstrip('/')}"
-        
         response = session.get(url, timeout=10)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'html.parser')
-        product_name_element = soup.find('h1', class_='page-title') 
+        # Extract React data from the page
+        react_data = extract_react_data(response.text)
         
-        if product_name_element:
-            product_name = product_name_element.text.strip()
-            data_handler.add_success(product_id, product_name, url)
+        if react_data:
+            # Extract product fields from React data
+            product_data = extract_product_fields(react_data)
+            
+            if product_data and product_data.get('name'):
+                data_handler.add_success(product_id, product_data, url)
+            else:
+                error_msg = f"No product data found in react_data for product_id '{product_id}'"
+                data_handler.add_failure(product_id, url, error_msg)
         else:
-            error_msg = f"Product name not found for product_id '{product_id}' on URL: {url}"
+            error_msg = f"react_data not found for product_id '{product_id}' on URL: {url}"
             data_handler.add_failure(product_id, url, error_msg)
             
     except requests.exceptions.HTTPError as e:
@@ -240,14 +302,14 @@ def crawl_and_process_urls_threaded(crawl_list, processed_ids, output_files,
     data_handler.processed_ids = processed_ids.copy()
     
     total_to_crawl = len(crawl_list)
-    logging.info(f"🚀 Starting threaded crawl with {max_workers} workers for {total_to_crawl} URLs...")
+    logging.info(f"🚀 Starting threaded crawl with {max_workers} workers for {total_to_crawl} products...")
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all crawling tasks
         futures = []
-        for product_id, url in crawl_list:
+        for product_id in crawl_list:
             future = executor.submit(
-                crawl_single_url, product_id, url, data_handler,
+                crawl_single_url, product_id, data_handler,
                 crawl_delay_min, crawl_delay_max, retry_delay
             )
             futures.append(future)
@@ -262,7 +324,7 @@ def crawl_and_process_urls_threaded(crawl_list, processed_ids, output_files,
                 # Log progress every 50 completions (less verbose than every single crawl)
                 if completed % 50 == 0:
                     progress_pct = (completed / total_to_crawl) * 100
-                    logging.info(f"🔄 Progress: {completed}/{total_to_crawl} URLs completed ({progress_pct:.1f}%)")
+                    logging.info(f"🔄 Progress: {completed}/{total_to_crawl} products completed ({progress_pct:.1f}%)")
                     
             except Exception as e:
                 logging.error(f"Thread execution error: {e}")
@@ -283,7 +345,17 @@ def save_successful_data(product_data, output_file):
     """Saves final list of successful product records to a CSV file."""
     if product_data:
         logging.info(f"💾 Final save: Writing {len(product_data)} successful product records to '{output_file}'...")
-        fieldnames = ["product_id", "product_name", "url"]
+        
+        # Define all possible fieldnames
+        base_fields = ["product_id", "url"]
+        product_fields = [
+            'name', 'attribute_set', 'type_id', 'price', 'min_price', 'max_price',
+            'gold_weight', 'none_metal_weight', 'fixed_silver_weight', 'material_design',
+            'qty', 'collection', 'product_type', 'category_name', 'platinum_palladium_info_in_alloy',
+            'bracelet_without_chain', 'gender', 'included_chain_weight'
+        ]
+        fieldnames = base_fields + product_fields
+        
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -293,9 +365,9 @@ def save_successful_data(product_data, output_file):
         logging.warning("⚠️  No product data to save. The process finished with no successful results.")
 
 # --- Function to print final summary ---
-def print_summary(product_urls, successful_crawls, failed_crawls_current_run, failed_output_file):
+def print_summary(product_ids, successful_crawls, failed_crawls_current_run, failed_output_file):
     """Prints a final summary of the crawling process."""
-    total_products = len(product_urls)
+    total_products = len(product_ids)
     logging.info("\n--- CRAWLING SUMMARY ---")
     logging.info(f"Total unique products to crawl: {total_products}")
     logging.info(f"Successfully crawled (this run): {successful_crawls}")
@@ -346,8 +418,8 @@ def process_product_data():
         return
 
     summary_collection = db['summary']
-    product_urls = get_unique_product_urls(summary_collection, unique_product_ids_file, event_collections)
-    if not product_urls:
+    product_ids = get_unique_product_ids(summary_collection, unique_product_ids_file, event_collections)
+    if not product_ids:
         client.close()
         return
 
@@ -360,7 +432,7 @@ def process_product_data():
         except Exception as e:
             logging.error(f"Error loading processed IDs from '{processed_product_ids_file}': {e}. Starting from scratch.")
 
-    crawl_list = [item for item in product_urls.items() if item[0] not in processed_ids]
+    crawl_list = [product_id for product_id in product_ids if product_id not in processed_ids]
     
     output_files = {
         'failed': failed_output_file,
@@ -380,7 +452,7 @@ def process_product_data():
     # Final save - ensures the final complete dataset is saved
     save_successful_data(product_data, product_output_file)
     
-    print_summary(product_urls, len(product_data), len(failed_data_current_run), failed_output_file)
+    print_summary(product_ids, len(product_data), len(failed_data_current_run), failed_output_file)
 
     client.close()
     logging.info("🎉 Threaded product data processing complete. MongoDB connection closed.")
